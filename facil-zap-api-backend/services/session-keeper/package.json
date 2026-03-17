@@ -1,0 +1,42 @@
+{
+  "name": "@facilzap/session-keeper",
+  "version": "2.0.0",
+  "description": "The Session Keeper - Gerenciamento Multi-Device com Noise Protocol Framework",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "jest"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "helmet": "^7.1.0",
+    "compression": "^1.7.4",
+    "ioredis": "^5.3.2",
+    "pino": "^8.16.0",
+    "pino-pretty": "^10.2.3",
+    "dotenv": "^16.3.1",
+    "zod": "^3.22.4",
+    "@whiskeysockets/baileys": "^6.6.0",
+    "@hapi/boom": "^10.0.1",
+    "node-cache": "^5.1.2",
+    "axios": "^1.6.0",
+    "sharp": "^0.33.0",
+    "fluent-ffmpeg": "^2.1.2",
+    "qrcode": "^1.5.3",
+    "@prisma/client": "5.10.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.20",
+    "@types/cors": "^2.8.15",
+    "@types/compression": "^1.7.4",
+    "@types/node": "^20.8.0",
+    "@types/fluent-ffmpeg": "^2.1.24",
+    "@types/qrcode": "^1.5.5",
+    "typescript": "^5.2.2",
+    "ts-node-dev": "^2.0.0",
+    "prisma": "5.10.2"
+  }
+}

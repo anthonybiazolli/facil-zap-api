@@ -1,0 +1,342 @@
+version: '3.8'
+
+services:
+  # ============================================
+  # INFRASTRUCTURE LAYER
+  # ============================================
+  
+  redis:
+    image: redis:7-alpine
+    container_name: facilzap-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+      - ./infrastructure/docker/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    ports:
+      - "6379:6379"
+    networks:
+      - facilzap-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: facilzap-postgres
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - facilzap-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mongodb:
+    image: mongo:6-jammy
+    container_name: facilzap-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
+      MONGO_INITDB_DATABASE: ${MONGO_DB}
+    volumes:
+      - mongo_data:/data/db
+      - ./infrastructure/docker/mongo/init.js:/docker-entrypoint-initdb.d/init.js
+    ports:
+      - "27017:27017"
+    networks:
+      - facilzap-network
+    command: ["--auth", "--bind_ip_all"]
+
+  minio:
+    image: minio/minio:latest
+    container_name: facilzap-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - facilzap-network
+
+  # ============================================
+  # MICROSERVICES LAYER
+  # ============================================
+
+  session-keeper:
+    build:
+      context: .
+      dockerfile: services/session-keeper/Dockerfile
+    container_name: facilzap-session-keeper
+    environment:
+      - NODE_ENV=${NODE_ENV}
+      - SERVICE_NAME=session-keeper
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+      - DB_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      - MONGO_URL=mongodb://${MONGO_USER}:${MONGO_PASSWORD}@mongodb:27017/${MONGO_DB}?authSource=admin
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - WA_WEBHOOK_URL=${WA_WEBHOOK_URL}
+    volumes:
+      - session_data:/app/sessions
+      - ./services/session-keeper/src:/app/src
+    ports:
+      - "3001:3000"
+    networks:
+      - facilzap-network
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_started
+    restart: unless-stopped
+
+  message-queue:
+    build:
+      context: .
+      dockerfile: services/message-queue/Dockerfile
+    container_name: facilzap-message-queue
+    environment:
+      - NODE_ENV=${NODE_ENV}
+      - SERVICE_NAME=message-queue
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+      - DB_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      - SESSION_KEEPER_URL=http://session-keeper:3000
+      - ANTI_BAN_URL=http://anti-ban-engine:3000
+      - MAX_CONCURRENT_JOBS=10
+      - RATE_LIMIT_PER_MINUTE=30
+    volumes:
+      - ./services/message-queue/src:/app/src
+    ports:
+      - "3002:3000"
+    networks:
+      - facilzap-network
+    depends_on:
+      - session-keeper
+      - redis
+    restart: unless-stopped
+
+  anti-ban-engine:
+    build:
+      context: .
+      dockerfile: services/anti-ban-engine/Dockerfile
+    container_name: facilzap-anti-ban
+    environment:
+      - NODE_ENV=${NODE_ENV}
+      - SERVICE_NAME=anti-ban-engine
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+      - DB_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      - TYPING_SPEED_WPM=45
+      - MIN_INTERVAL_MS=1500
+      - MAX_INTERVAL_MS=4500
+      - HUMAN_WAKEUP_ENABLED=true
+    volumes:
+      - ./services/anti-ban-engine/src:/app/src
+    ports:
+      - "3003:3000"
+    networks:
+      - facilzap-network
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  legal-compliance:
+    build:
+      context: .
+      dockerfile: services/legal-compliance/Dockerfile
+    container_name: facilzap-legal
+    environment:
+      - NODE_ENV=${NODE_ENV}
+      - SERVICE_NAME=legal-compliance
+      - DB_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      - MONGO_URL=mongodb://${MONGO_USER}:${MONGO_PASSWORD}@mongodb:27017/${MONGO_DB}?authSource=admin
+      - ZAPSIGN_API_KEY=${ZAPSIGN_API_KEY}
+      - ZAPSIGN_WEBHOOK_SECRET=${ZAPSIGN_WEBHOOK_SECRET}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - GOOGLE_REFRESH_TOKEN=${GOOGLE_REFRESH_TOKEN}
+      - SMTP_FROM_EMAIL=${SMTP_FROM_EMAIL}
+      - CONTRACT_HASH_SECRET=${CONTRACT_HASH_SECRET}
+    volumes:
+      - ./services/legal-compliance/src:/app/src
+      - legal_docs:/app/documents
+    ports:
+      - "3004:3000"
+    networks:
+      - facilzap-network
+    depends_on:
+      - postgres
+      - mongodb
+    restart: unless-stopped
+
+  payment-gateway:
+    build:
+      context: .
+      dockerfile: services/payment-gateway/Dockerfile
+    container_name: facilzap-payment
+    environment:
+      - NODE_ENV=${NODE_ENV}
+      - SERVICE_NAME=payment-gateway
+      - DB_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      - BANCO_INTER_CLIENT_ID=${BANCO_INTER_CLIENT_ID}
+      - BANCO_INTER_CLIENT_SECRET=${BANCO_INTER_CLIENT_SECRET}
+      - BANCO_INTER_CERT_PATH=/app/certs/inter_cert.pem
+      - BANCO_INTER_KEY_PATH=/app/certs/inter_key.pem
+      - PIX_KEY=${PIX_KEY}
+      - PIX_MERCHANT_NAME=${PIX_MERCHANT_NAME}
+      - PIX_CITY=${PIX_CITY}
+      - WEBHOOK_SECRET=${PAYMENT_WEBHOOK_SECRET}
+      - POLLING_INTERVAL_MS=10000
+    volumes:
+      - ./services/payment-gateway/src:/app/src
+      - ./certs:/app/certs:ro
+    ports:
+      - "3005:3000"
+    networks:
+      - facilzap-network
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    container_name: facilzap-gateway
+    environment:
+      - NODE_ENV=${NODE_ENV}
+      - SERVICE_NAME=api-gateway
+      - PORT=3000
+      - DB_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      - JWT_SECRET=${JWT_SECRET}
+      - API_KEY_SALT=${API_KEY_SALT}
+      - SESSION_KEEPER_URL=http://session-keeper:3000
+      - MESSAGE_QUEUE_URL=http://message-queue:3000
+      - ANTI_BAN_URL=http://anti-ban-engine:3000
+      - LEGAL_COMPLIANCE_URL=http://legal-compliance:3000
+      - PAYMENT_GATEWAY_URL=http://payment-gateway:3000
+      - RATE_LIMIT_WINDOW_MS=60000
+      - RATE_LIMIT_MAX_REQUESTS=100
+      - REQUEST_TIMEOUT_MS=30000
+    volumes:
+      - ./services/api-gateway/src:/app/src
+    ports:
+      - "8080:3000"
+    networks:
+      - facilzap-network
+    depends_on:
+      - session-keeper
+      - message-queue
+      - anti-ban-engine
+      - legal-compliance
+      - payment-gateway
+    restart: unless-stopped
+
+  # ============================================
+  # MONITORING & OBSERVABILITY
+  # ============================================
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: facilzap-prometheus
+    volumes:
+      - ./infrastructure/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - facilzap-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: facilzap-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infrastructure/monitoring/grafana:/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+    networks:
+      - facilzap-network
+
+  # ============================================
+  # WORKER PROCESSES
+  # ============================================
+
+  message-worker:
+    build:
+      context: .
+      dockerfile: services/message-queue/Dockerfile.worker
+    environment:
+      - NODE_ENV=${NODE_ENV}
+      - SERVICE_NAME=message-worker
+      - DB_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+      - SESSION_KEEPER_URL=http://session-keeper:3000
+      - ANTI_BAN_URL=http://anti-ban-engine:3000
+      - CONCURRENCY=5
+    volumes:
+      - ./services/message-queue/src:/app/src
+    networks:
+      - facilzap-network
+    depends_on:
+      - redis
+      - session-keeper
+    restart: unless-stopped
+    deploy:
+      replicas: 3
+
+  payment-worker:
+    build:
+      context: .
+      dockerfile: services/payment-gateway/Dockerfile.worker
+    container_name: facilzap-payment-worker
+    environment:
+      - NODE_ENV=${NODE_ENV}
+      - SERVICE_NAME=payment-worker
+      - DB_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      - BANCO_INTER_CLIENT_ID=${BANCO_INTER_CLIENT_ID}
+      - BANCO_INTER_CLIENT_SECRET=${BANCO_INTER_CLIENT_SECRET}
+      - POLLING_INTERVAL_MS=10000
+    volumes:
+      - ./services/payment-gateway/src:/app/src
+      - ./certs:/app/certs:ro
+    networks:
+      - facilzap-network
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  postgres_data:
+  mongo_data:
+  minio_data:
+  session_data:
+  legal_docs:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  facilzap-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

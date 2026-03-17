@@ -1,0 +1,456 @@
+generator client {
+  provider = "prisma-client-js"
+  // Adiciona suporte a binários nativos do Linux (Alpine) usado no Docker
+  binaryTargets = ["native", "linux-musl", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DB_URL")
+}
+
+// ============================================
+// CORE ENTITIES
+// ============================================
+
+model User {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  passwordHash String    @map("password_hash")
+  name         String
+  companyName  String?   @map("company_name")
+  document     String?   // CPF/CNPJ
+  phone        String?
+  isActive     Boolean   @default(true) @map("is_active")
+  isVerified   Boolean   @default(false) @map("is_verified")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+  lastLoginAt  DateTime? @map("last_login_at")
+
+  // Relations
+  apiKeys      ApiKey[]
+  instances    WhatsAppInstance[]
+  contracts    Contract[]
+  invoices     Invoice[]
+  auditLogs    AuditLog[]
+  webhooks     WebhookConfig[] // Adicionado o relacionamento inverso correto
+
+  @@map("users")
+}
+
+model ApiKey {
+  id          String    @id @default(uuid())
+  userId      String    @map("user_id")
+  name        String
+  keyHash     String    @unique @map("key_hash")
+  keyPrefix   String    @map("key_prefix") // First 8 chars for display
+  permissions String[]  @default(["read", "write"])
+  isActive    Boolean   @default(true) @map("is_active")
+  lastUsedAt  DateTime? @map("last_used_at")
+  expiresAt   DateTime? @map("expires_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  rotatedAt   DateTime? @map("rotated_at")
+
+  // Relations
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  auditLogs AuditLog[]
+
+  @@map("api_keys")
+}
+
+// ============================================
+// WHATSAPP SESSION MANAGEMENT
+// ============================================
+
+model WhatsAppInstance {
+  id               String         @id @default(uuid())
+  userId           String         @map("user_id")
+  name             String         // Friendly name
+  sessionId        String         @unique @map("session_id") // Internal session identifier
+  phoneNumber      String?        @map("phone_number")
+  pushName         String?        @map("push_name")
+  status           InstanceStatus @default(DISCONNECTED)
+  
+  // Noise Protocol Framework credentials (encrypted)
+  authInfo         Json?          @map("auth_info")
+  
+  // Session configuration
+  config           Json           @default("{}") // Sync settings, etc.
+  
+  // Metrics
+  messagesSent     Int            @default(0) @map("messages_sent")
+  messagesReceived Int            @default(0) @map("messages_received")
+  lastActivityAt   DateTime?      @map("last_activity_at")
+  connectedAt      DateTime?      @map("connected_at")
+  disconnectedAt   DateTime?      @map("disconnected_at")
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime       @updatedAt @map("updated_at")
+
+  // Relations
+  user             User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  chats            Chat[]
+  messageQueue     QueuedMessage[]
+  auditLogs        AuditLog[]
+
+  @@index([userId])
+  @@index([status])
+  @@map("whatsapp_instances")
+}
+
+model Chat {
+  id            String           @id @default(uuid())
+  instanceId    String           @map("instance_id")
+  remoteJid     String           @map("remote_jid") // WhatsApp JID
+  name          String?
+  profilePicUrl String?          @map("profile_pic_url")
+  isGroup       Boolean          @default(false) @map("is_group")
+  isArchived    Boolean          @default(false) @map("is_archived")
+  isPinned      Boolean          @default(false) @map("is_pinned")
+  unreadCount   Int              @default(0) @map("unread_count")
+  lastMessageAt DateTime?        @map("last_message_at")
+  createdAt     DateTime         @default(now()) @map("created_at")
+  updatedAt     DateTime         @updatedAt @map("updated_at")
+
+  // Relations
+  instance      WhatsAppInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  messages      Message[]
+
+  @@unique([instanceId, remoteJid])
+  @@index([instanceId])
+  @@map("chats")
+}
+
+model Message {
+  id          String      @id @default(uuid())
+  chatId      String      @map("chat_id")
+  messageId   String      @unique @map("message_id") // WhatsApp message ID
+  fromMe      Boolean     @map("from_me")
+  senderJid   String      @map("sender_jid")
+  type        MessageType
+  content     Json        // Flexible content storage
+  mediaUrl    String?     @map("media_url")
+  mimeType    String?     @map("mime_type")
+  fileName    String?     @map("file_name")
+  fileSize    Int?        @map("file_size")
+  isForwarded Boolean     @default(false) @map("is_forwarded")
+  isDeleted   Boolean     @default(false) @map("is_deleted")
+  
+  // Anti-ban tracking
+  sentAt      DateTime    @map("sent_at")
+  deliveredAt DateTime?   @map("delivered_at")
+  readAt      DateTime?   @map("read_at")
+  failedAt    DateTime?   @map("failed_at")
+  failReason  String?     @map("fail_reason")
+  
+  createdAt   DateTime    @default(now()) @map("created_at")
+
+  // Relations
+  chat        Chat        @relation(fields: [chatId], references: [id], onDelete: Cascade)
+
+  @@index([chatId])
+  @@index([sentAt])
+  @@map("messages")
+}
+
+model QueuedMessage {
+  id            String           @id @default(uuid())
+  instanceId    String           @map("instance_id")
+  jobId         String?          @unique @map("job_id") // BullMQ job ID
+  remoteJid     String           @map("remote_jid")
+  type          MessageType
+  content       Json
+  priority      Int              @default(5) // 1-10, lower = higher priority
+  
+  // Scheduling
+  scheduledFor  DateTime         @map("scheduled_for")
+  sentAt        DateTime?        @map("sent_at")
+  
+  // Status
+  status        QueueStatus      @default(PENDING)
+  attempts      Int              @default(0)
+  maxAttempts   Int              @default(3) @map("max_attempts")
+  lastError     String?          @map("last_error")
+  
+  // Anti-ban metadata
+  antiBanConfig Json?            @map("anti_ban_config") // Interval, typing simulation, etc.
+  
+  createdAt     DateTime         @default(now()) @map("created_at")
+  updatedAt     DateTime         @updatedAt @map("updated_at")
+
+  // Relations
+  instance      WhatsAppInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  @@index([instanceId, status])
+  @@index([scheduledFor])
+  @@map("queued_messages")
+}
+
+// ============================================
+// LEGAL COMPLIANCE MODULE
+// ============================================
+
+model Contract {
+  id               String         @id @default(uuid())
+  userId           String         @map("user_id")
+  zapsignDocId     String?        @unique @map("zapsign_doc_id")
+  
+  // Contract details
+  title            String
+  description      String?
+  templateType     String         @map("template_type") // service, subscription, etc.
+  
+  // Hash for integrity verification
+  contentHash      String         @map("content_hash") // SHA-256
+  hashAlgorithm    String         @default("SHA-256") @map("hash_algorithm")
+  
+  // Parties
+  providerName     String         @map("provider_name")
+  providerDocument String         @map("provider_document")
+  clientName       String         @map("client_name")
+  clientDocument   String         @map("client_document")
+  clientEmail      String         @map("client_email")
+  
+  // Terms
+  value            Decimal        @db.Decimal(15, 2)
+  currency         String         @default("BRL")
+  paymentMethod    String         @map("payment_method") // pix, credit_card, etc.
+  paymentDueHours  Int            @default(24) @map("payment_due_hours")
+  
+  // Status workflow
+  status           ContractStatus @default(DRAFT)
+  signedAt         DateTime?      @map("signed_at")
+  signedByIp       String?        @map("signed_by_ip")
+  paymentReceivedAt DateTime?     @map("payment_received_at")
+  activatedAt      DateTime?      @map("activated_at")
+  revokedAt        DateTime?      @map("revoked_at")
+  revokeReason     String?        @map("revoke_reason")
+  
+  // Files
+  pdfUrl           String?        @map("pdf_url")
+  signedPdfUrl     String?        @map("signed_pdf_url")
+  
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime       @updatedAt @map("updated_at")
+
+  // Relations
+  user             User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  invoice          Invoice?
+  auditLogs        AuditLog[]
+
+  @@index([userId, status])
+  @@index([zapsignDocId])
+  @@map("contracts")
+}
+
+model Invoice {
+  id                 String        @id @default(uuid())
+  userId             String        @map("user_id")
+  contractId         String?       @unique @map("contract_id")
+  
+  // Invoice details
+  invoiceNumber      String        @unique @map("invoice_number")
+  description        String
+  value              Decimal       @db.Decimal(15, 2)
+  currency           String        @default("BRL")
+  
+  // PIX data
+  pixTxid            String?       @unique @map("pix_txid")
+  pixPayload         String?       @map("pix_payload") // Copia e Cola
+  pixQrCodeUrl       String?       @map("pix_qr_code_url")
+  
+  // Status
+  status             InvoiceStatus @default(PENDING)
+  paidAt             DateTime?     @map("paid_at")
+  paidAmount         Decimal?      @db.Decimal(15, 2) @map("paid_amount")
+  
+  // Bank reconciliation
+  bankReference      String?       @map("bank_reference")
+  reconciliationData Json?         @map("reconciliation_data")
+  
+  dueDate            DateTime      @map("due_date")
+  createdAt          DateTime      @default(now()) @map("created_at")
+  updatedAt          DateTime      @updatedAt @map("updated_at")
+
+  // Relations
+  user               User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  contract           Contract?     @relation(fields: [contractId], references: [id])
+
+  @@index([userId, status])
+  @@index([pixTxid])
+  @@map("invoices")
+}
+
+// ============================================
+// AUDIT & MONITORING
+// ============================================
+
+model AuditLog {
+  id             String            @id @default(uuid())
+  
+  // Actor
+  userId         String?           @map("user_id")
+  apiKeyId       String?           @map("api_key_id")
+  instanceId     String?           @map("instance_id")
+  contractId     String?           @map("contract_id")
+  
+  // Action details
+  action         String            // CREATE_INSTANCE, SEND_MESSAGE, SIGN_CONTRACT, etc.
+  resource       String            // instance, message, contract, etc.
+  resourceId     String?           @map("resource_id")
+  
+  // Request context
+  ipAddress      String?           @map("ip_address")
+  userAgent      String?           @map("user_agent")
+  requestMethod  String?           @map("request_method")
+  requestPath    String?           @map("request_path")
+  requestBody    Json?             @map("request_body")
+  responseStatus Int?              @map("response_status")
+  
+  // Result
+  success        Boolean
+  errorMessage   String?           @map("error_message")
+  
+  createdAt      DateTime          @default(now()) @map("created_at")
+
+  // Relations
+  user           User?             @relation(fields: [userId], references: [id])
+  apiKey         ApiKey?           @relation(fields: [apiKeyId], references: [id])
+  instance       WhatsAppInstance? @relation(fields: [instanceId], references: [id])
+  contract       Contract?         @relation(fields: [contractId], references: [id])
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+  @@index([instanceId])
+  @@map("audit_logs")
+}
+
+model WebhookConfig {
+  id               String    @id @default(uuid())
+  userId           String    @map("user_id")
+  
+  name             String
+  url              String
+  secret           String?   // For HMAC signature
+  
+  // Events to subscribe
+  events           String[]  // message.received, message.sent, contract.signed, etc.
+  
+  // Retry configuration
+  maxRetries       Int       @default(3) @map("max_retries")
+  retryIntervalMs  Int       @default(5000) @map("retry_interval_ms")
+  
+  isActive         Boolean   @default(true) @map("is_active")
+  lastTriggeredAt  DateTime? @map("last_triggered_at")
+  lastErrorAt      DateTime? @map("last_error_at")
+  lastErrorMessage String?   @map("last_error_message")
+  
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Adicionado o relacionamento inverso para WebhookDelivery
+  deliveries       WebhookDelivery[]
+
+  @@index([userId])
+  @@map("webhook_configs")
+}
+
+model WebhookDelivery {
+  id             String         @id @default(uuid())
+  configId       String         @map("config_id")
+  event          String
+  payload        Json
+  
+  // Delivery tracking
+  attemptNumber  Int            @map("attempt_number")
+  status         DeliveryStatus
+  httpStatusCode Int?           @map("http_status_code")
+  responseBody   String?        @map("response_body")
+  errorMessage   String?        @map("error_message")
+  
+  createdAt      DateTime       @default(now()) @map("created_at")
+  completedAt    DateTime?      @map("completed_at")
+
+  // Relação adicionada para corrigir o modelo
+  webhookConfig  WebhookConfig  @relation(fields: [configId], references: [id], onDelete: Cascade)
+
+  @@index([configId])
+  @@index([status])
+  @@map("webhook_deliveries")
+}
+
+// ============================================
+// ENUMS (CORRIGIDO)
+// ============================================
+
+enum InstanceStatus {
+  DISCONNECTED
+  CONNECTING
+  QR_READY
+  AUTHENTICATED
+  READY
+  ERROR
+}
+
+enum MessageType {
+  text
+  image
+  video
+  audio
+  document
+  location
+  contact
+  sticker
+  reaction
+  poll
+  button
+  template
+  TEXT
+  IMAGE
+  VIDEO
+  AUDIO
+  DOCUMENT
+  LOCATION
+  CONTACT
+  STICKER
+}
+
+enum QueueStatus {
+  PENDING
+  SCHEDULED
+  PROCESSING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  CANCELLED
+}
+
+enum ContractStatus {
+  DRAFT
+  SENT
+  OPENED
+  SIGNED
+  PAYMENT_PENDING
+  PAYMENT_RECEIVED
+  ACTIVE
+  EXPIRED
+  REVOKED
+}
+
+enum InvoiceStatus {
+  PENDING
+  PAID
+  OVERDUE
+  CANCELLED
+  REFUNDED
+}
+
+enum DeliveryStatus {
+  PENDING
+  DELIVERED
+  FAILED
+  RETRYING
+}

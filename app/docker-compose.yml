@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: facilzap-frontend
+    ports:
+      - "80:80"
+    environment:
+      - VITE_API_URL=${VITE_API_URL}
+      - VITE_API_KEY=${VITE_API_KEY}
+    restart: unless-stopped

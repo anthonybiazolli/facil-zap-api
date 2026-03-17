@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  facilzap-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: facilzap-frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      # Sincroniza o seu código local com o container (Hot Reload)
+      - .:/app
+      # Protege os módulos instalados no Linux do container
+      - /app/node_modules
+    environment:
+      # Variáveis injetadas no Vite
+      - VITE_API_URL=http://localhost:8080/v1
+      - VITE_API_KEY=fz_ZNuyxL5qCYYvaUc1YxaBXZ1Vu9ZXFpby6vDhbja8Gtc
+    restart: unless-stopped
